@@ -6,6 +6,7 @@
   class OpenKeyval {
     const kMaxDataSize = 65536;
     const kReadOnlyKeyPrefix = 'rok-';
+    const kWriteOnceKeyPrefix = 'wok-';
 
     public static function Dispatch() {
       self::fixMagicQuotesIfNeccessary();
@@ -73,7 +74,10 @@
         if(self::IsReadOnlyKey($key)) {
           self::Response(200, array('read_only_key' => $key));
         } else {
-          self::Response(200, array('key' => $key, 'hash' => self::HashForKey($key), 'read_only_key' => self::ReadOnlyKey($key)));
+          self::Response(200, array('key' => $key,
+                                    'hash' => self::HashForKey($key),
+                                    'read_only_key' => self::ReadOnlyKey($key),
+                                    'is_write_once' => self::IsWriteOnceKey($key)));
         }
       }
 
@@ -102,22 +106,24 @@
       
       $memcache = GetMemcacheHandle();
       
-      $currentLimit = $memcache->get($key)*1;
+      if ($memcache !== false) {
       
-      if ($type == "read") {
-        $maxLimit = 1000;
-      } else {
-        $maxLimit = 100;
-      }        
-
-      $expire = $currentTimeChunk-time();
-            
-      $memcache->set($key,$currentLimit+1,false,$expire);
-
-      if ($currentLimit>$maxLimit) {
-        self::Response(400, array('error' => 'API usage limit exceeded; exceeded hourly quota','throttleType'=>$type,'requestsInPeriodSoFar'=>$currentLimit,'quota'=>$maxLimit,'periodCountdown'=>$expire));
-      } 
+        $currentLimit = $memcache->get($key)*1;
       
+        if ($type == "read") {
+          $maxLimit = 1000;
+        } else {
+          $maxLimit = 100;
+        }        
+
+        $expire = $currentTimeChunk-time();
+
+        $memcache->set($key,$currentLimit+1,false,$expire);
+
+        if ($currentLimit>$maxLimit) {
+          self::Response(400, array('error' => 'API usage limit exceeded; exceeded hourly quota','throttleType'=>$type,'requestsInPeriodSoFar'=>$currentLimit,'quota'=>$maxLimit,'periodCountdown'=>$expire));
+        }
+      }
     }
 
     private function fixMagicQuotesIfNeccessary() {
@@ -190,8 +196,11 @@
 
       if($value === '') {
         if(OpenKeyval_Storage_Cached::Get($key)) {
-          OpenKeyval_Storage_Cached::Delete($key);
-          self::Response(200, array('status' => 'deleted'));
+          if (OpenKeyval_Storage_Cached::Delete($key)) {
+            self::Response(200, array('status' => 'deleted'));
+          } else {
+            self::Response(403, array('status' => 'delete_failed'));
+          }
           return false;
         } else {
           self::Response(200, array('status' => 'did_not_exist'));
@@ -209,6 +218,10 @@
 
     public static function IsReadOnlyKey($key) {
       return (strpos($key, OpenKeyval::kReadOnlyKeyPrefix) === 0);
+    }
+    
+    public static function IsWriteOnceKey($key) {
+      return (strpos($key, OpenKeyval::kWriteOnceKeyPrefix) === 0);
     }
 
     public static function IsValidKey($key) {
@@ -287,8 +300,9 @@
 
 
     public static function Delete($key) {
-      if(OpenKeyval::IsReadOnlyKey($key)) {
-        //  Can't delete with a read-only key
+      if(OpenKeyval::IsReadOnlyKey($key) ||
+         OpenKeyval::IsWriteOnceKey($key)) {
+        //  Can't delete a write-once key or with a read-only key
         return false;
       }
 
@@ -322,8 +336,28 @@
 
       $hash = OpenKeyval::HashForKey($key);
       $path = self::PathForHash($hash);
+      
+      if (OpenKeyval::IsWriteOnceKey($key)) {
+        if (!self::CheckAndSetKey($path)) {
+          // Write-once key already written to
+          return false;
+        }
+      }
+      
       $rv = file_put_contents($path, $value, LOCK_EX);
       return ($rv !== false);
+    }
+    
+    public static function CheckAndSetKey($path) {
+      $resource = @fopen($path, 'x+b');
+      
+      if ($resource === false) {
+        // Couldn't create the file, means it already exists
+        return false;
+      }
+      
+      fclose($resource);
+      return true;
     }
   }
 
